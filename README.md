@@ -85,6 +85,7 @@ CORES=12 MEMORY=32768 DISK_SIZE=128 VMID=120 NONINTERACTIVE=1 \
 | Problem | Lösung |
 |---|---|
 | Install-Script bricht ab | Erneut mit `--debug` ausführen (`bash -x`-Log wird komplett ausgegeben) + Log `/var/log/comfyui-install.log` bzw. `/var/log/comfyui-create-vm-<VMID>.log` |
+| `MAX n vcpus allowed per VM on this node` | Host hat weniger Threads als gewählte Cores (bei `cpu=host` Limit). Das Script begrenzt **automatisch** auf die Node-Threads (Build ≥ 2026-11-10-v2); bei älteren Läufen: `qm set <VMID> --cores $(nproc) && qm start <VMID>` |
 | Web-UI nicht erreichbar | `systemctl status comfyui` + `journalctl -u comfyui -e` in der VM; Firewall-Port 8188 (in der VM keine UFW aktiv, am Proxmox-Firewall-Profil prüfen) |
 | IP-Erkennung fehlgeschlagen | `qm terminal <VMID>` → `ip a`; danach install.sh direkt in der VM ausführen |
 | `nvidia-smi` fehlt in der VM | Passthrough-Konfig am Host prüfen (IOMMU!); VM-Reboot; `lspci | grep -i nvidia` in der VM |

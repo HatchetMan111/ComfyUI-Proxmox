@@ -48,7 +48,7 @@ msg_ok()   { echo -e "${C_OK}✔${C_RESET} $*"; }
 msg_warn() { echo -e "${C_WARN}⚠${C_RESET} $*"; }
 msg_err()  { echo -e "${C_ERR}✖${C_RESET} $*" >&2; }
 
-SCRIPT_BUILD="2026-11-07-v7"
+SCRIPT_BUILD="2026-11-10-v2"
 echo -e "${C_STEP}ComfyUI-Proxmox create-vm.sh – Build ${SCRIPT_BUILD}${C_RESET}"
 echo -e "${C_STEP}Wenn hier NICHT 'Build ${SCRIPT_BUILD}' steht, führst du eine alte Kopie aus!${C_RESET}"
 echo -e "${C_STEP}Log: /var/log/comfyui-create-vm-<VMID>.log (wird nach Feststehen der VMID angelegt)${C_RESET}"
@@ -771,6 +771,18 @@ if qm status "$VMID" >/dev/null 2>&1; then
 fi
 msg_ok "Konfiguration steht. Verwende VMID ${VMID} (Maschine: ${MACHINE})."
 
+# vCPU-Limit des Nodes VOR dem Erstellen berücksichtigen: Mit --cpu host
+# begrenzt QEMU die vCPUs pro VM auf die Thread-Anzahl des Nodes. qm create
+# akzeptiert mehr Cores kommentarlos - qm start scheitert erst später mit
+# Exit 255 und "MAX n vcpus allowed per VM on this node" (Live-Fall 2026-11-10,
+# ProxSmartHome: 4 Threads, Default 8 Cores). => Hier automatisch senken.
+HOST_THREADS="$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 0)"
+if [ "${HOST_THREADS:-0}" -gt 0 ] && [ "$CORES" -gt "$HOST_THREADS" ]; then
+  msg_warn "Der Node hat nur ${HOST_THREADS} Threads - ${CORES} vCPUs sind mit cpu=host nicht startbar (MAX ${HOST_THREADS} vcpus allowed per VM)."
+  msg_warn "=> Begrenze CORES automatisch auf ${HOST_THREADS} (mehr vCPUs bräuchten einen generischen CPU-Typ - für ComfyUI nicht nötig)."
+  CORES="$HOST_THREADS"
+fi
+
 # Ab hier alles zusätzlich in eine Log-Datei spiegeln (Fehlersuche beim Erstlauf).
 LOG_FILE="/var/log/comfyui-create-vm-${VMID}.log"
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
@@ -1212,7 +1224,26 @@ VM_IP=""
 MAC=""
 STATIC_CANDIDATE=""
 if [ "$START_VM" = "yes" ]; then
-  qm start "$VMID"
+  # Starten mit Sicherheitsnetz: Falls der Node das vCPU-Limit trotzdem
+  # blockiert (z.B. bei anderem CPU-Typ oder zwischenzeitlich geändertem CORES),
+  # einmal automatisch reduzieren statt abzubrechen.
+  set +e
+  start_err="$(qm start "$VMID" 2>&1)"
+  start_rc=$?
+  set -e
+  if [ "$start_rc" -ne 0 ]; then
+    echo "$start_err" >&2
+    if echo "$start_err" | grep -q "vcpus allowed per VM"; then
+      msg_warn "qm start blockiert durch das vCPU-Limit des Nodes - setze CORES=${HOST_THREADS:-4} und starte erneut..."
+      qm set "$VMID" --cores "${HOST_THREADS:-4}"
+      qm start "$VMID"
+    else
+      msg_err "qm start schlug fehl (Ausgabe oben, Exit ${start_rc}). Diagnose:"
+      msg_err "  qm config ${VMID}   # Cores/Memory/Disks prüfen"
+      msg_err "  Details: ${LOG_FILE}"
+      exit 1
+    fi
+  fi
   msg_ok "VM gestartet."
 
   # --------------------------------------------------------------------------
