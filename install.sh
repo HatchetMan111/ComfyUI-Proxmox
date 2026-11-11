@@ -41,7 +41,7 @@ err()    { echo -e "${C_ERR}✖${C_RESET} $*" >&2; }
 die()    { err "$1"; exit 1; }
 header() { echo -e "\n${C_STEP}${C_BOLD}━━━ $1 ━━━${C_RESET}"; }
 
-SCRIPT_BUILD="2026-11-11-v1"
+SCRIPT_BUILD="2026-11-11-v2"
 APP_NAME="ComfyUI"
 APP_REPO="https://github.com/comfy-org/ComfyUI"
 APP_DIR="/opt/ComfyUI"
@@ -181,6 +181,24 @@ handle_proxmox_host() {
 check_prerequisites() {
   [ "$(id -u)" -eq 0 ] || die "Bitte als root ausführen (z.B. per SSH in der VM)."
   command -v systemctl >/dev/null 2>&1 || die "systemd nicht gefunden - dieses Script braucht ein normales Linux (Debian/Ubuntu)."
+
+  # Platz VOR dem apt-Lauf prüfen: PyTorch + Abhängigkeiten brauchen ~15 GB.
+  # Ohne diese Prüfung läuft apt 10 Minuten und stirbt dann mitten im
+  # Entpacken mit "No space left on device" (Live-Fall 2026-11-11: VM mit
+  # 3,3-GB-Dateisystem, weil die Partition nie vergrößert wurde).
+  local free_mb free_gb
+  free_mb="$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}')"
+  free_gb=$(( ${free_mb:-0} / 1024 ))
+  if [ "${free_mb:-0}" -lt 10240 ]; then
+    err "Nur ${free_gb} GB (${free_mb} MB) frei auf / - PyTorch + ComfyUI brauchen ~15 GB."
+    err "Auf dem Proxmox-Host vergrößern und danach in der VM das Dateisystem ziehen:"
+    err "  qm resize <VMID> scsi0 +20G"
+    err "  # in der VM: growpart /dev/sda 1 && resize2fs /dev/sda1"
+    die "Zu wenig Platz - Installation abgebrochen (nichts wurde verändert)."
+  elif [ "${free_mb:-0}" -lt 20480 ]; then
+    warn "Nur ${free_gb} GB frei - genug für ComfyUI + PyTorch, aber ohne große Modelle."
+  fi
+
   command -v curl >/dev/null 2>&1 || {
     info "curl fehlt - installiere es..."
     apt-get update -qq || true

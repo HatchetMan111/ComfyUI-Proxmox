@@ -48,7 +48,7 @@ msg_ok()   { echo -e "${C_OK}✔${C_RESET} $*"; }
 msg_warn() { echo -e "${C_WARN}⚠${C_RESET} $*"; }
 msg_err()  { echo -e "${C_ERR}✖${C_RESET} $*" >&2; }
 
-SCRIPT_BUILD="2026-11-11-v2"
+SCRIPT_BUILD="2026-11-11-v3"
 echo -e "${C_STEP}ComfyUI-Proxmox create-vm.sh – Build ${SCRIPT_BUILD}${C_RESET}"
 echo -e "${C_STEP}Wenn hier NICHT 'Build ${SCRIPT_BUILD}' steht, führst du eine alte Kopie aus!${C_RESET}"
 echo -e "${C_STEP}Log: /var/log/comfyui-create-vm-<VMID>.log (wird nach Feststehen der VMID angelegt)${C_RESET}"
@@ -851,6 +851,10 @@ validate_uint() {
 validate_uint CORES "$CORES" 1
 validate_uint MEMORY "$MEMORY" 1024
 validate_uint DISK_SIZE "$DISK_SIZE" 16
+if [ "$DISK_SIZE" -lt 48 ]; then
+  msg_warn "DISK_SIZE=${DISK_SIZE} GB ist knapp: PyTorch/ComfyUI belegen ~15 GB, ein SDXL/Flux-Modell 7-24 GB."
+  msg_warn "Empfohlen: >= 64 GB. Später erweiterbar mit: qm resize ${VMID:-<VMID>} scsi0 +20G"
+fi
 
 if [ -z "$VMID" ]; then
   VMID="$(pvesh get /cluster/nextid)"
@@ -1265,6 +1269,93 @@ set_root_password() {
   return 0
 }
 
+# Vergrößert die Root-Partition auf die volle Disk-Größe (VOR dem Mount).
+# Nötig, weil cloud-init im Image deaktiviert ist: cloud-init macht sonst beim
+# ersten Boot growpart+resize2fs. Ohne das bleibt die Partition auf der
+# Cloud-Image-Größe (~3,3 GB), obwohl die Disk 32-64 GB hat -> apt bricht beim
+# Installieren ab mit "No space left on device" (Live-Fall 2026-11-11, VM 101).
+grow_partition_to_disk() {
+  local dev="$1" part="$2" pnum sec disk_bytes start sectors end_bytes free_mb new_bytes
+  pnum="$(cat "/sys/class/block/$(basename "$part")/partition" 2>/dev/null || true)"
+  [ -n "${pnum:-}" ] || { msg_warn "Partitionsnummer von ${part} unbekannt - überspringe Vergrößerung."; return 0; }
+  sec="$(blockdev --getss "$dev" 2>/dev/null || echo 512)"
+  disk_bytes="$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)"
+  start="$(cat "/sys/class/block/$(basename "$part")/start" 2>/dev/null || echo 0)"
+  sectors="$(cat "/sys/class/block/$(basename "$part")/size" 2>/dev/null || echo 0)"
+  [ "$disk_bytes" -gt 0 ] || { msg_warn "Disk-Größe von ${dev} nicht lesbar - überspringe Vergrößerung."; return 0; }
+  end_bytes=$(( (start + sectors) * sec ))
+  free_mb=$(( (disk_bytes - end_bytes) / 1048576 ))
+  if [ "$free_mb" -lt 1024 ]; then
+    msg_info "Root-Partition füllt die Disk bereits (Rest: ${free_mb} MB) - kein Grow nötig."
+    return 0
+  fi
+
+  msg_info "Root-Partition liegt auf einem ${free_mb} MB kleinen Teil der Disk - vergrößere sie..."
+
+  # 1) GPT-Backup-Header ans neue Disk-Ende schieben, sonst verweigert sfdisk
+  #    die Änderung ("GPT PMBR size mismatch") bzw. die Tabelle wird korrupt.
+  if [ "$(blkid -o value -s PTTYPE "$dev" 2>/dev/null || true)" = "gpt" ]; then
+    if command -v sgdisk >/dev/null 2>&1; then
+      sgdisk -e "$dev" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # 2) Partition bis zum Ende erweitern. growpart kann das am saubersten,
+  #    ist auf Proxmox aber nicht immer installiert -> sfdisk als Standardweg.
+  if command -v growpart >/dev/null 2>&1 && growpart "$dev" "$pnum" >/dev/null 2>&1; then
+    : # erledigt
+  else
+    # ", +" = Start unverändert, Größe bis zum Ende der Disk
+    if ! echo ", +" | sfdisk -N "$pnum" -f "$dev" >/dev/null 2>&1; then
+      msg_warn "Partition konnte nicht vergrößert werden (sfdisk)."
+      msg_warn "Manuell in der VM: sudo growpart /dev/sda 1 && sudo resize2fs /dev/sda1"
+      return 1
+    fi
+  fi
+
+  # 3) Kernel die neue Größe bekannt machen (bei gemounteten Disks via partx)
+  partprobe "$dev" >/dev/null 2>&1 || true
+  partx -u "$dev" >/dev/null 2>&1 || true
+  for _g in 1 2 3 4 5; do
+    new_bytes="$(blockdev --getsize64 "$part" 2>/dev/null || echo 0)"
+    [ "$new_bytes" -gt "$(( sectors * sec ))" ] && break
+    sleep 1
+    partx -u "$dev" >/dev/null 2>&1 || true
+  done
+  if [ "${new_bytes:-0}" -le "$(( sectors * sec ))" ]; then
+    msg_warn "Kernel meldet die neue Partitionsgröße nicht - Dateisystem wird gleich trotzdem versucht."
+  fi
+  msg_ok "Partition ${pnum} vergrößert ($(( (new_bytes + 1048575) / 1048576 )) MB)."
+  return 0
+}
+
+# Zieht das Dateisystem auf die neue Partitionsgröße nach (nach dem Mount,
+# ext4 kann das online; xfs nur gemountet via xfs_growfs).
+resize_root_filesystem() {
+  local part="$1" mnt="$2" before after
+  before="$(df -Pm "$mnt" 2>/dev/null | awk 'NR==2{print $2}')"
+  if [ "${before:-0}" -ge 20000 ]; then
+    msg_ok "Dateisystem: ${before} MB nutzbar."
+    return 0
+  fi
+  msg_info "Vergrößere Dateisystem (aktuell ${before:-?} MB nutzbar)..."
+  resize2fs "$part" >/dev/null 2>&1 || true
+  after="$(df -Pm "$mnt" 2>/dev/null | awk 'NR==2{print $2}')"
+  if [ "${after:-0}" -le "${before:-0}" ] && command -v xfs_growfs >/dev/null 2>&1; then
+    xfs_growfs "$mnt" >/dev/null 2>&1 || true
+    after="$(df -Pm "$mnt" 2>/dev/null | awk 'NR==2{print $2}')"
+  fi
+  if [ "${after:-0}" -gt "${before:-0}" ]; then
+    msg_ok "Dateisystem vergrößert: ${before} -> ${after} MB nutzbar."
+    return 0
+  fi
+  # Wichtig: NICHT stillschweigend weitermachen - die Installation würde nach
+  # ~10 Minuten apt-Lauf mit "No space left on device" abbrechen.
+  msg_err "Dateisystem blieb bei ${before:-?} MB - die Installation würde an Platzmangel scheitern."
+  msg_err "Manuell beheben: qm terminal <VMID> -> growpart /dev/sda 1 && resize2fs /dev/sda1"
+  return 1
+}
+
 prepare_image() {
   local mnt="/mnt/comfyui-prepare"
   local vol_spec vol_dev part p nbd_dev
@@ -1299,9 +1390,35 @@ except Exception:
 
   mkdir -p "$mnt"
   part=""
+  # Root-Partition VOR dem Mount auf die Disk-Größe wachsen lassen. cloud-init
+  # ist im Image deaktiviert und würde das sonst beim ersten Boot erledigen -
+  # ohne Grow bleibt das Dateisystem bei ~3,3 GB und apt scheitert mit
+  # "No space left on device" (Live-Fall 2026-11-11, VM 101).
+  _root_candidate=""
+  for p in $(ls "${nbd_dev}"p* 2>/dev/null || true); do
+    [ -b "$p" ] || continue
+    if blkid -o value -s TYPE "$p" 2>/dev/null | grep -qE '^(ext[234]|xfs)$'; then
+      _root_candidate="$p"
+    fi
+  done
+  if [ -n "$_root_candidate" ]; then
+    if ! grow_partition_to_disk "$nbd_dev" "$_root_candidate"; then
+      msg_err "Ohne vergrößerte Root-Partition würde die Installation an fehlendem Platz scheitern."
+      umount "$mnt" 2>/dev/null || true
+      qemu-nbd -d "$nbd_dev" >/dev/null 2>&1 || true
+      return 1
+    fi
+  else
+    msg_warn "Keine ext4/xfs-Partition gefunden (LVM-Image?) - überspringe Partitions-Grow."
+  fi
   # Alle Partitionen dynamisch aufzählen statt starrer p1/p2/p3-Liste (je nach Image
   # liegt root anders). Whole-Disk als letzter Fallback.
   _parts="$(ls "${nbd_dev}"p* 2>/dev/null || true)"
+  # Die zuvor vergrößerte Partition zuerst probieren (bei Images mit separater
+  # /boot-Partition wäre "erste ext4-Partition" sonst die falsche).
+  if [ -n "${_root_candidate:-}" ]; then
+    _parts="${_root_candidate} ${_parts}"
+  fi
   # shellcheck disable=SC2086
   for p in $_parts "$nbd_dev"; do
     [ -b "$p" ] || continue
@@ -1322,6 +1439,13 @@ except Exception:
     return 1
   fi
   msg_ok "Root-Partition gemountet: ${part}"
+
+  # Dateisystem (ext4 online / xfs) auf die neue Partitionsgröße nachziehen.
+  if ! resize_root_filesystem "$part" "$mnt"; then
+    umount "$mnt" 2>/dev/null || true
+    qemu-nbd -d "$nbd_dev" >/dev/null 2>&1 || true
+    return 1
+  fi
 
   # 1) Root-Passwort direkt setzen (das aus der Zusammenfassung, später per 'passwd' änderbar)
   # KEIN 'chpasswd --root': das startet im Gast-chroot die komplette PAM-Kette
