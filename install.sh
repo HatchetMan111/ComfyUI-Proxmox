@@ -21,12 +21,11 @@
 #
 # Umgebungsvariablen (vor dem Aufruf setzen):
 #   GPU_TYPE=nvidia|amd|intel|none   GPU-Typ erzwingen (Default: auto)
-#   DOWNLOAD_MODEL=sd15|sdxl|flux-schnell
-#                                    Lädt nach der Installation ein Modell
-#                                    herunter (Default: keiner - die UI ist
-#                                    sofort nutzbar, Modelle können jederzeit
-#                                    über den ComfyUI-Manager nachgeladen
-#                                    werden)
+#   DOWNLOAD_MODEL=sd15|sdxl      Lädt nach der Installation ein Modell
+#                                 herunter (Default: keiner - die UI ist
+#                                 sofort nutzbar, Modelle können jederzeit
+#                                 über den ComfyUI-Manager nachgeladen
+#                                 werden)
 # =============================================================================
 set -euo pipefail
 
@@ -42,7 +41,7 @@ err()    { echo -e "${C_ERR}✖${C_RESET} $*" >&2; }
 die()    { err "$1"; exit 1; }
 header() { echo -e "\n${C_STEP}${C_BOLD}━━━ $1 ━━━${C_RESET}"; }
 
-SCRIPT_BUILD="2026-11-10-v1"
+SCRIPT_BUILD="2026-11-11-v1"
 APP_NAME="ComfyUI"
 APP_REPO="https://github.com/comfy-org/ComfyUI"
 APP_DIR="/opt/ComfyUI"
@@ -79,8 +78,15 @@ trap err_chain ERR
 
 LOG_FILE="${LOG_FILE:-/var/log/${SERVICE_NAME}-install.log}"
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
-# shellcheck disable=SC2094
-exec > >(tee -a "$LOG_FILE") 2>&1
+# Ohne root (z.B. 'install.sh --help') ist /var/log nicht beschreibbar - dann
+# lieber ohne Log weiterlaufen als mit 'tee: Permission denied' zu starten.
+if ! { : >> "$LOG_FILE"; } 2>/dev/null; then
+  LOG_FILE=""
+fi
+if [ -n "$LOG_FILE" ]; then
+  # shellcheck disable=SC2094
+  exec > >(tee -a "$LOG_FILE") 2>&1
+fi
 
 usage() {
   cat <<EOF
@@ -98,7 +104,7 @@ Aufruf:  install.sh [--update|--status|--uninstall|--purge-data|--debug|--help]
 
 Umgebungsvariablen:
   GPU_TYPE=nvidia|amd|intel|none   GPU-Typ erzwingen (Default: automatisch per lspci)
-  DOWNLOAD_MODEL=sd15|sdxl|flux-schnell   Modell herunterladen (Default: keiner)
+  DOWNLOAD_MODEL=sd15|sdxl   Modell herunterladen (Default: keiner)
 EOF
 }
 
@@ -124,24 +130,39 @@ is_proxmox_host() {
   [ -f /etc/pve/.version ] || command -v pveversion >/dev/null 2>&1
 }
 
+# Auch unter 'curl | bash' oder nach der Log-Umleitung (tee) gibt es oft noch
+# ein echtes Terminal - dann darf der Assistent angeboten werden. [ -t 0 ]
+# allein wäre hier zu streng.
+have_tty() {
+  { : >/dev/tty; } 2>/dev/null
+}
+
 handle_proxmox_host() {
   header "Proxmox-Host erkannt"
   warn "Dieses Script installiert ${APP_NAME} IN einer VM und muss dort laufen."
   warn "Auf dem Host läuft es ins Leere (kein systemd-Service-Scope, falsches Ziel)."
 
-  if [ "${NONINTERACTIVE:-0}" != "1" ] && [ -t 0 ]; then
+  if [ "${NONINTERACTIVE:-0}" != "1" ] && have_tty; then
     echo
     info "Der zugehörige VM-Ersteller create-vm.sh kann das übernehmen:"
     info "  - legt eine Debian/Ubuntu-VM an (Standard: 8 vCPU, 16 GB RAM, 64 GB Disk)"
     info "  - ermittelt automatisch die IP-Adresse der VM"
     info "  - ruft dieses install.sh anschließend automatisch IN der VM auf"
     echo
-    if read -r -t 60 -p "Jetzt create-vm.sh herunterladen und ausführen? [j/N] " answer; then
+    if read -r -t 60 -p "Jetzt create-vm.sh herunterladen und ausführen? [j/N] " answer </dev/tty; then
       case "$answer" in
         j|J|y|Y|ja|Ja|yes|Yes)
           info "Lade create-vm.sh herunter und starte es..."
           curl -fsSL --retry 3 --retry-delay 2 "${CREATE_VM_URL}" -o /tmp/comfyui-create-vm.sh
-          exec bash /tmp/comfyui-create-vm.sh
+          # install.sh spiegelt stdout bereits in 'tee' - dadurch wäre [ -t 1 ]
+          # im Kind false und create-vm.sh würde den whiptail-Assistenten
+          # überspringen (und still den 16-GB-Default nehmen). Deshalb die
+          # echten Terminal-Descriptors wiederherstellen, wenn vorhanden.
+          if [ -e /dev/tty ]; then
+            exec bash /tmp/comfyui-create-vm.sh </dev/tty >/dev/tty 2>&1
+          else
+            exec bash /tmp/comfyui-create-vm.sh
+          fi
           ;;
       esac
     fi
@@ -372,12 +393,21 @@ deploy_comfyui() {
   fi
 
   mkdir -p "${APP_DIR}"
-  if ! git clone --depth 1 "${APP_REPO}" "${APP_DIR}"; then
+  # In ein temporäres Verzeichnis klonen und dann hineinmergen: Ein direktes
+  # 'git clone' in ein vorhandenes /opt/ComfyUI (z.B. nach einer alten,
+  # halben Installation) schlägt fehl - und das alte 'rm -rf ${APP_DIR}' im
+  # Fallback hätte dabei vorhandene Modelle mitgelöscht.
+  local clone_tmp="${APP_DIR}.clone.$$"
+  rm -rf "$clone_tmp"
+  if ! git clone --depth 1 "${APP_REPO}" "$clone_tmp"; then
     # Fallback: Legacy-Repo-Pfad (comfyanonymous), falls die Org-URL je sperrt
     warn "Clone von comfy-org fehlgeschlagen - Fallback: comfyanonymous/ComfyUI..."
-    rm -rf "${APP_DIR}"
-    git clone --depth 1 "https://github.com/comfyanonymous/ComfyUI.git" "${APP_DIR}" || die "ComfyUI-Clone fehlgeschlagen (Netzwerk/DNS prüfen)."
+    rm -rf "$clone_tmp"
+    git clone --depth 1 "https://github.com/comfyanonymous/ComfyUI.git" "$clone_tmp" || die "ComfyUI-Clone fehlgeschlagen (Netzwerk/DNS prüfen)."
   fi
+  # Merge statt Ersetzen: vorhandene Modelle/Checkpoints bleiben erhalten.
+  cp -a "$clone_tmp/." "${APP_DIR}/"
+  rm -rf "$clone_tmp"
   ok "ComfyUI-Code deployed (Version: $(git -C "${APP_DIR}" log -1 --format='%h %s' 2>/dev/null || echo unbekannt))."
   return 0
 }
@@ -395,7 +425,9 @@ install_pytorch_and_requirements() {
   else
     info "Bestehendes venv wird in place aktualisiert."
   fi
-  chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}/venv"
+  # Auch /opt/uv-python nach dem venv-Create chownen: 'uv venv --python 3.12'
+  # lädt die Standalone-Python ERST hier herunter (als root).
+  chown -R "${SERVICE_USER}:${SERVICE_USER}" /opt/uv-python /opt/uv-cache "${APP_DIR}/venv" 2>/dev/null || true
 
   local pip_pkgs=(torch torchvision torchaudio)
   info "Installiere PyTorch von ${PYTORCH_INDEX} (je nach Bandbreite mehrere Minuten)..."
@@ -438,7 +470,9 @@ create_service_user() {
   if id "${SERVICE_USER}" >/dev/null 2>&1; then
     ok "Benutzer ${SERVICE_USER} existiert bereits."
   else
-    useradd --system --create-home --home-dir "${APP_DIR}" --shell /bin/bash "${SERVICE_USER}" \
+    # --user-group: garantiert die Gruppe 'comfyui', die die systemd-Unit als
+    # Group= verwendet. --no-create-home: /opt/ComfyUI existiert bereits.
+    useradd --system --user-group --no-create-home --home-dir "${APP_DIR}" --shell /bin/bash "${SERVICE_USER}" \
       || die "Benutzer ${SERVICE_USER} konnte nicht angelegt werden."
     ok "Systembenutzer ${SERVICE_USER} angelegt."
   fi
@@ -480,10 +514,15 @@ Environment=HOME=${APP_DIR}
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable "${SERVICE_NAME}.service" >/dev/null
+  systemctl daemon-reload || die "systemctl daemon-reload fehlgeschlagen."
+  systemctl enable "${SERVICE_NAME}.service" >/dev/null 2>&1 \
+    || warn "Autostart (systemctl enable) konnte nicht aktiviert werden - Service startet trotzdem jetzt."
   info "Starte/Starte neu ${SERVICE_NAME}.service..."
-  systemctl restart "${SERVICE_NAME}.service"
+  if ! systemctl restart "${SERVICE_NAME}.service"; then
+    err "Service-Start fehlgeschlagen. Letzte Journal-Zeilen:"
+    journalctl -u "${SERVICE_NAME}" -n 40 --no-pager >&2 || true
+    die "Service '${SERVICE_NAME}' konnte nicht gestartet werden (siehe Journal oben)."
+  fi
   ok "Service ${SERVICE_NAME} aktiviert (Restart=always, After=network-online.target, onboot kommt über die VM)."
 }
 
@@ -604,6 +643,7 @@ do_status() {
 
 do_uninstall() {
   header "Deinstallation"
+  [ "$(id -u)" -eq 0 ] || die "Bitte als root ausführen (z.B. per SSH in der VM)."
   systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
   systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
   rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
@@ -611,18 +651,29 @@ do_uninstall() {
   ok "Service gestoppt + entfernt."
   if [ "${PURGE_DATA:-0}" = "1" ]; then
     info "Lösche ${APP_DIR} inklusive aller Modelle (--purge-data)..."
-    rm -rf "${APP_DIR}"
+    rm -rf "${APP_DIR}" /opt/uv-python /opt/uv-cache
+    ok "Alle Daten gelöscht."
   else
-    info "Lösche Code, behalte Modelle (${APP_DIR}/models bleibt)..."
-    rm -rf "${APP_DIR}" "${APP_DIR}/models"
+    # WICHTIG: ${APP_DIR} NICHT komplett löschen - dort liegen die Modelle.
+    # (Alter Bug: 'rm -rf "${APP_DIR}" "${APP_DIR}/models"' hat trotz
+    # gegenteiliger Meldung auch die Modelle vernichtet.)
+    info "Lösche Code/venv, behalte Modelle (${APP_DIR}/models bleibt)..."
+    if [ -d "${APP_DIR}" ]; then
+      find "${APP_DIR}" -mindepth 1 -maxdepth 1 ! -name models -exec rm -rf {} + 2>/dev/null || true
+    fi
+    ok "Modelle bleiben erhalten in ${APP_DIR}/models."
   fi
-  id "${SERVICE_USER}" >/dev/null 2>&1 && userdel "${SERVICE_USER}" 2>/dev/null || true
+  if id "${SERVICE_USER}" >/dev/null 2>&1; then
+    userdel "${SERVICE_USER}" 2>/dev/null || warn "Benutzer ${SERVICE_USER} konnte nicht entfernt werden."
+    ok "Benutzer ${SERVICE_USER} entfernt."
+  fi
   ok "${APP_NAME} deinstalliert. Models-Pfad: $( [ "${PURGE_DATA:-0}" = "1" ] && echo 'gelöscht' || echo "${APP_DIR}/models (falls vorhanden)")"
   return 0
 }
 
 do_update() {
   header "Update"
+  [ "$(id -u)" -eq 0 ] || die "Bitte als root ausführen (z.B. per SSH in der VM)."
   if [ ! -d "${APP_DIR}/.git" ]; then
     die "Keine bestehende Installation gefunden (${APP_DIR}) - erst normal installieren."
   fi
@@ -665,7 +716,12 @@ main() {
   fi
 
   if is_proxmox_host; then
-    handle_proxmox_host
+    if [ "$MODE" = "install" ]; then
+      handle_proxmox_host
+    else
+      err "Dieses Script muss IN der ComfyUI-VM laufen - '--${MODE}' ist auf dem Proxmox-Host nicht sinnvoll."
+      die "Bitte per SSH in die VM: ssh root@<VM-IP>   (danach: install.sh --${MODE})"
+    fi
   fi
 
   case "$MODE" in
