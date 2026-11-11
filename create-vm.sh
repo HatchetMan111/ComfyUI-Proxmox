@@ -48,7 +48,7 @@ msg_ok()   { echo -e "${C_OK}✔${C_RESET} $*"; }
 msg_warn() { echo -e "${C_WARN}⚠${C_RESET} $*"; }
 msg_err()  { echo -e "${C_ERR}✖${C_RESET} $*" >&2; }
 
-SCRIPT_BUILD="2026-11-10-v2"
+SCRIPT_BUILD="2026-11-11-v1"
 echo -e "${C_STEP}ComfyUI-Proxmox create-vm.sh – Build ${SCRIPT_BUILD}${C_RESET}"
 echo -e "${C_STEP}Wenn hier NICHT 'Build ${SCRIPT_BUILD}' steht, führst du eine alte Kopie aus!${C_RESET}"
 echo -e "${C_STEP}Log: /var/log/comfyui-create-vm-<VMID>.log (wird nach Feststehen der VMID angelegt)${C_RESET}"
@@ -148,7 +148,7 @@ sniff_dhcp_offer() {
   raw="$(timeout "$secs" tcpdump -i "$dev" -n -l -v -c 40 \
       "ether host ${mac} and (udp port 67 or udp port 68)" 2>/dev/null || true)"
   DHCP_PACKETS="$(echo "$raw" | grep -c . || true)"
-  ip="$(echo "$raw" | grep -oiE '(your address|yiaddr)[ :=]+[0-9]+(\.[0-9]+){3}' \
+  ip="$(echo "$raw" | grep -oiE '(your[- ]?address|your[- ]?ip|yiaddr)[ :=]+[0-9]+(\.[0-9]+){3}' \
       | grep -oE '[0-9]+(\.[0-9]+){3}' \
       | grep -vE '^(0\.|127\.|169\.254\.)' | head -1 || true)"
   if [ -n "$ip" ] && valid_ipv4 "$ip"; then
@@ -614,11 +614,62 @@ command -v bridge >/dev/null 2>&1 || msg_warn "'bridge' (iproute2) fehlt – FDB
 msg_ok "Läuft auf einem Proxmox-Host."
 
 # ----------------------------------------------------------------------------
+# RAM-Helfer (werden auch beim Start-Fallback in Schritt 6 gebraucht)
+# ----------------------------------------------------------------------------
+# Liest einen Wert aus /proc/meminfo in MB. Robust gegen fehlende Keys:
+# gibt immer eine ganze Zahl zurück (0 bei Problemen), nie eine leere Zeile -
+# sonst würden die Arithmetik-Blöcke unter 'set -e' abbrechen.
+meminfo_mb() {
+  local key="$1" kb
+  kb="$(awk -v k="${key}:" '$1 == k { print $2; exit }' /proc/meminfo 2>/dev/null || true)"
+  case "${kb:-}" in
+    ''|*[!0-9]*) echo 0 ;;
+    *) echo $(( kb / 1024 )) ;;
+  esac
+}
+
+# Wie viel RAM darf eine NEUE VM bekommen, ohne dass 'qm start' mit
+# "cannot set up guest memory 'pc.ram': Cannot allocate memory" scheitert?
+# Basis ist MemAvailable (nicht MemFree: der Page-Cache ist wiederverwendbar)
+# minus einer Host-Reserve. Bei overcommit_memory=2 zählt zusätzlich das
+# freie Commit-Limit, sonst scheitert mmap trotz freiem Page-Cache.
+host_memory_fit_mb() {
+  local avail reserve overcommit commit_limit committed commit_free fit
+  avail="$(meminfo_mb MemAvailable)"
+  [ "$avail" -gt 0 ] || avail="$(meminfo_mb MemFree)"
+  reserve="${MEM_RESERVE_MB:-2048}"
+  case "$reserve" in ''|*[!0-9]*) reserve=2048 ;; esac
+  overcommit="$(cat /proc/sys/vm/overcommit_memory 2>/dev/null || echo 0)"
+  if [ "$overcommit" = "2" ]; then
+    commit_limit="$(meminfo_mb CommitLimit)"
+    committed="$(meminfo_mb Committed_AS)"
+    commit_free=$(( commit_limit - committed ))
+    [ "$commit_free" -lt "$avail" ] && avail="$commit_free"
+  fi
+  fit=$(( avail - reserve ))
+  [ "$fit" -lt 0 ] && fit=0
+  # Auf 256 MB abrunden -> schöne, nachvollziehbare Werte statt 15871 MB.
+  echo $(( fit / 256 * 256 ))
+}
+
+print_ram_diagnostics() {
+  msg_info "RAM-Diagnose des Hosts:"
+  free -m 2>/dev/null | sed 's/^/  /' || true
+  echo "  overcommit_memory : $(cat /proc/sys/vm/overcommit_memory 2>/dev/null || echo '?')  (0=heuristisch, 1=immer, 2=nie)"
+  echo "  Laufende VMs      :"
+  qm list 2>/dev/null | sed 's/^/  /' || true
+  echo "  Top-RAM-Verbraucher auf dem Host:"
+  ps -eo rss=,comm= --sort=-rss 2>/dev/null | head -5 \
+    | awk '{printf "    %6d MB  %s\n", $1 / 1024, $2}' || true
+}
+
+# ----------------------------------------------------------------------------
 # Konfiguration - Standardwerte (per ENV-Variable überschreibbar)
 # ----------------------------------------------------------------------------
 VMID="${VMID:-}"
 VM_NAME="${VM_NAME:-comfyui}"
 MACHINE="${MACHINE:-q35}"               # q35 (modern, empfohlen) oder i440fx (Legacy)
+BIOS="${BIOS:-}"                        # leer = automatisch je OS (Ubuntu: ovmf, Debian: seabios)
 CORES="${CORES:-8}"
 MEMORY="${MEMORY:-16384}"               # MB (ComfyUI: unter 8 GB macht SDXL/Flux keinen Spaß)
 DISK_SIZE="${DISK_SIZE:-64}"            # GB (Modell-Dateien brauchen 5-40 GB pro Modell)
@@ -642,6 +693,12 @@ SNIFF_SECS="${SNIFF_SECS:-30}"                                       # Stufe 3: 
 SNIFF_PAUSE="${SNIFF_PAUSE:-10}"                                     # Stufe 3: Pause zwischen den Runden, Sekunden
 PCI_HOSTPCI="${PCI_HOSTPCI:-}"           # z.B. "01:00" -> GPU direkt bei Erstellung durchreichen
 NONINTERACTIVE="${NONINTERACTIVE:-}"     # 1 = Assistent überspringen, nur ENV-Variablen/Standardwerte nutzen
+MEM_RESERVE_MB="${MEM_RESERVE_MB:-2048}" # RAM, der für den Proxmox-Host reserviert bleibt
+MIN_MEMORY_MB="${MIN_MEMORY_MB:-2048}"   # kleinste VM-RAM-Größe, die automatisch gesetzt werden darf
+FORCE_MEMORY="${FORCE_MEMORY:-0}"        # 1 = RAM-Begrenzung überspringen (auf eigene Gefahr)
+# Beide Werte müssen ganze Zahlen sein, sonst bricht die Arithmetik weiter unten.
+case "$MEM_RESERVE_MB" in ''|*[!0-9]*) MEM_RESERVE_MB=2048 ;; esac
+case "$MIN_MEMORY_MB" in ''|*[!0-9]*) MIN_MEMORY_MB=2048 ;; esac
 
 # ----------------------------------------------------------------------------
 # Interaktiver Assistent (whiptail) - wie bei den Proxmox Community-Scripts
@@ -762,9 +819,42 @@ case "$MACHINE" in
   *) msg_err "Unbekannter MACHINE-Typ: ${MACHINE} (erlaubt: q35, i440fx)"; exit 1 ;;
 esac
 
+# Firmware automatisch je Image: Ubuntu-Cloud-Images sind UEFI-bootfähig,
+# die Debian-genericcloud-Images booten zuverlässig per BIOS/SeaBIOS.
+# (OVMF + Debian-genericcloud kann ohne ESP in einer Bootschleife enden.)
+if [ -z "$BIOS" ]; then
+  case "$OS_IMAGE" in
+    debian*) BIOS="seabios" ;;
+    *)       BIOS="ovmf" ;;
+  esac
+fi
+case "$BIOS" in
+  ovmf|seabios) ;;
+  *) msg_err "Unbekanntes BIOS: ${BIOS} (erlaubt: ovmf, seabios)"; exit 1 ;;
+esac
+
+# Numerische Eingaben validieren: whiptail-Inputboxen nehmen jeden String an.
+# Ohne diese Prüfung knallt z.B. "16 GB" erst tief in 'qm create' oder in der
+# Arithmetik - mit einer unverständlichen Fehlermeldung.
+validate_uint() {
+  local name="$1" val="${2:-}" min="$3"
+  case "$val" in
+    ''|*[!0-9]*) msg_err "${name} muss eine ganze Zahl sein (erhalten: '${val}')."; exit 1 ;;
+  esac
+  if [ "$val" -lt "$min" ]; then
+    msg_err "${name} muss mindestens ${min} sein (erhalten: ${val})."; exit 1
+  fi
+}
+validate_uint CORES "$CORES" 1
+validate_uint MEMORY "$MEMORY" 1024
+validate_uint DISK_SIZE "$DISK_SIZE" 16
+
 if [ -z "$VMID" ]; then
   VMID="$(pvesh get /cluster/nextid)"
 fi
+case "${VMID:-}" in
+  ''|*[!0-9]*) msg_err "VMID muss eine ganze Zahl sein (erhalten: '${VMID}')."; exit 1 ;;
+esac
 if qm status "$VMID" >/dev/null 2>&1; then
   msg_err "VMID ${VMID} existiert bereits. Andere VMID mit VMID=<id> angeben."
   exit 1
@@ -789,13 +879,99 @@ mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
 # shellcheck disable=SC2094
 exec > >(tee -a "$LOG_FILE") 2>&1
 msg_info "Log-Datei: ${LOG_FILE}"
-msg_info "Effektive Konfiguration: VMID=${VMID} NAME=${VM_NAME} MACHINE=${MACHINE} OS=${OS_IMAGE} CORES=${CORES} MEM=${MEMORY} DISK=${DISK_SIZE}G STORAGE=${STORAGE} BRIDGE=${BRIDGE} NET=${NET_MODEL} IPCONFIG=${IPCONFIG}"
+
+# ----------------------------------------------------------------------------
+# RAM-Preflight (Live-Bug 2026-11-11, ProxSmartHome)
+# ----------------------------------------------------------------------------
+# QEMU allokiert den kompletten Gast-RAM beim Start. Ist auf dem Host nicht
+# genug frei, scheitert 'qm start' mit Exit 255:
+#   kvm: cannot set up guest memory 'pc.ram': Cannot allocate memory
+# Der Default (16 GB) passt auf vielen kleinen Hosts nicht. Deshalb wird
+# MEMORY VOR dem Erstellen auf den tatsächlich verfügbaren RAM begrenzt -
+# analog zum bereits vorhandenen vCPU-Limit. Mit FORCE_MEMORY=1 abschaltbar.
+HOST_MEM_TOTAL_MB="$(meminfo_mb MemTotal)"
+HOST_MEM_AVAIL_MB="$(meminfo_mb MemAvailable)"
+HOST_SWAP_FREE_MB="$(meminfo_mb SwapFree)"
+MEM_FIT_MB="$(host_memory_fit_mb)"
+
+if [ "$FORCE_MEMORY" != "1" ] && [ "$HOST_MEM_TOTAL_MB" -gt 0 ]; then
+  msg_info "Host-RAM: ${HOST_MEM_TOTAL_MB} MB gesamt, ${HOST_MEM_AVAIL_MB} MB verfügbar, ${HOST_SWAP_FREE_MB} MB Swap frei."
+  if [ "$MEMORY" -gt "$MEM_FIT_MB" ]; then
+    if [ "$MEM_FIT_MB" -lt "$MIN_MEMORY_MB" ]; then
+      msg_err "Zu wenig freier Host-RAM für eine sinnvolle VM:"
+      msg_err "  verfügbar: ${HOST_MEM_AVAIL_MB} MB | Host-Reserve: ${MEM_RESERVE_MB} MB | nutzbar: ${MEM_FIT_MB} MB | Minimum: ${MIN_MEMORY_MB} MB"
+      print_ram_diagnostics
+      msg_err "Optionen:"
+      msg_err "  1) Andere VMs stoppen:  qm list   ->   qm shutdown <VMID>"
+      msg_err "  2) Host-Speicher prüfen: free -m; swapon --show"
+      msg_err "  3) Bewusst erzwingen (qm start kann erneut scheitern):"
+      msg_err "     FORCE_MEMORY=1 MEMORY=${MEMORY} bash -c \"\$(curl -fsSL ${INSTALL_SCRIPT_URL%/install.sh}/create-vm.sh)\""
+      exit 1
+    fi
+    msg_warn "Nur ${HOST_MEM_AVAIL_MB} MB RAM verfügbar - ${MEMORY} MB würden beim Start mit 'Cannot allocate memory' scheitern."
+    msg_warn "=> Begrenze MEMORY automatisch auf ${MEM_FIT_MB} MB (Host-Reserve: ${MEM_RESERVE_MB} MB)."
+    MEMORY="$MEM_FIT_MB"
+  fi
+  if [ "$MEMORY" -lt 8192 ]; then
+    msg_warn "Mit ${MEMORY} MB RAM ist ComfyUI stark eingeschränkt (SD 1.5/CPU okay, SDXL/Flux brauchen >= 12-16 GB)."
+    msg_warn "Mehr RAM: andere VMs stoppen oder den Host aufrüsten. Später anpassbar mit: qm set ${VMID} --memory <MB>"
+  fi
+elif [ "$FORCE_MEMORY" = "1" ]; then
+  msg_warn "FORCE_MEMORY=1: RAM-Begrenzung übersprungen - 'qm start' kann an fehlendem Host-RAM scheitern."
+else
+  msg_warn "Host-RAM konnte nicht aus /proc/meminfo gelesen werden - keine automatische RAM-Begrenzung."
+fi
+
+msg_info "Effektive Konfiguration: VMID=${VMID} NAME=${VM_NAME} MACHINE=${MACHINE} BIOS=${BIOS} OS=${OS_IMAGE} CORES=${CORES} MEM=${MEMORY} DISK=${DISK_SIZE}G STORAGE=${STORAGE} BRIDGE=${BRIDGE} NET=${NET_MODEL} IPCONFIG=${IPCONFIG}"
 
 # Später Preflight: Storage + Bridge existieren wirklich?
+if ! pvesm status 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$STORAGE"; then
+  # Auf Hosts ohne LVM-Thin gibt es kein 'local-lvm'. Statt hart abzubrechen,
+  # automatisch den ersten aktiven Storage mit Content-Type 'images' nehmen -
+  # aber nur, wenn der Nutzer den Default nicht selbst überschrieben hat.
+  if [ "$STORAGE" = "local-lvm" ]; then
+    AUTO_STORAGE="$(pvesm status --content images 2>/dev/null | awk 'NR>1 && $3=="active" {print $1; exit}')"
+    if [ -n "${AUTO_STORAGE:-}" ]; then
+      msg_warn "Storage 'local-lvm' existiert nicht - verwende automatisch '${AUTO_STORAGE}' (Content: images)."
+      STORAGE="$AUTO_STORAGE"
+    fi
+  fi
+fi
 if ! pvesm status 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$STORAGE"; then
   msg_err "Storage '${STORAGE}' existiert nicht (pvesm status). Verfügbare Storages:"
   pvesm status 2>/dev/null || true
   exit 1
+fi
+# Platzprüfung: 'qm create' würde bei zu kleinem Storage erst nach dem
+# Image-Import mit einer kryptischen Meldung abbrechen. Spalte 5 von
+# 'pvesm status' ist "Available" in KB.
+STORAGE_AVAIL_KB="$(pvesm status 2>/dev/null | awk -v s="$STORAGE" '$1==s {print $5; exit}')"
+case "${STORAGE_AVAIL_KB:-}" in
+  ''|*[!0-9]*) : ;;
+  *)
+    NEEDED_KB=$(( (DISK_SIZE + 8) * 1024 * 1024 ))
+    if [ "$STORAGE_AVAIL_KB" -lt "$NEEDED_KB" ]; then
+      msg_warn "Storage ${STORAGE}: nur $((STORAGE_AVAIL_KB / 1024 / 1024)) GB frei, empfohlen $((NEEDED_KB / 1024 / 1024)) GB (Disk ${DISK_SIZE} GB + Reserve)."
+      if [ "$STORAGE_AVAIL_KB" -lt $(( DISK_SIZE * 1024 * 1024 )) ]; then
+        msg_err "Zu wenig Platz auf '${STORAGE}' für eine ${DISK_SIZE}-GB-Disk. Abbruch, bevor Daten angelegt werden."
+        msg_err "  Anderen Storage wählen (STORAGE=<id>) oder Platz schaffen."
+        exit 1
+      fi
+    fi
+    ;;
+esac
+if [ ! -e "/sys/class/net/${BRIDGE}" ]; then
+  # Analog zum Storage: fehlt der Default vmbr0, automatisch die erste
+  # vorhandene vmbr*-Bridge nehmen (z. B. bei umbenannter Bridge).
+  if [ "$BRIDGE" = "vmbr0" ]; then
+    for _br in /sys/class/net/vmbr*; do
+      [ -e "$_br" ] || continue
+      AUTO_BRIDGE="$(basename "$_br")"
+      msg_warn "Bridge 'vmbr0' existiert nicht - verwende automatisch '${AUTO_BRIDGE}'."
+      BRIDGE="$AUTO_BRIDGE"
+      break
+    done
+  fi
 fi
 if [ ! -e "/sys/class/net/${BRIDGE}" ]; then
   msg_err "Bridge '${BRIDGE}' existiert nicht (/sys/class/net). Vorhanden:"
@@ -863,6 +1039,8 @@ case "$OS_IMAGE" in
     exit 1
     ;;
 esac
+
+msg_info "Firmware: ${BIOS} (Maschine: ${MACHINE})."
 IMG_FILE="${IMG_URL##*/}"
 CACHE_DIR="/var/lib/vz/template/comfyui-cache"
 mkdir -p "$CACHE_DIR"
@@ -958,8 +1136,7 @@ step 5 "VM erstellen"
 CREATE_ARGS=(
   --name "$VM_NAME"
   --machine "$MACHINE"
-  --bios ovmf
-  --efidisk0 "${STORAGE}:0,pre-enrolled-keys=0"
+  --bios "$BIOS"
   --cores "$CORES"
   --memory "$MEMORY"
   --cpu host
@@ -978,6 +1155,10 @@ CREATE_ARGS=(
   --ipconfig0 "$IPCONFIG"
 )
 
+if [ "$BIOS" = "ovmf" ]; then
+  CREATE_ARGS+=(--efidisk0 "${STORAGE}:0,pre-enrolled-keys=0")
+fi
+
 if [ -n "$PCI_HOSTPCI" ]; then
   CREATE_ARGS+=(--hostpci0 "${PCI_HOSTPCI},pcie=1,x-vga=1")
   msg_info "GPU ${PCI_HOSTPCI} wird direkt bei der Erstellung durchgereicht."
@@ -985,7 +1166,7 @@ fi
 
 qm create "$VMID" "${CREATE_ARGS[@]}"
 qm resize "$VMID" scsi0 "${DISK_SIZE}G" >/dev/null
-msg_ok "VM ${VMID} erstellt (${MACHINE} + OVMF/UEFI, ${DISK_SIZE}G Disk)."
+msg_ok "VM ${VMID} erstellt (${MACHINE} + ${BIOS}, ${DISK_SIZE}G Disk)."
 
 # ----------------------------------------------------------------------------
 # Schritt 5b: Image direkt vorbereiten (UNABHÄNGIG von cloud-init!)
@@ -1149,8 +1330,28 @@ EOF
   rm -f "$mnt/etc/network/interfaces.d/50-cloud-init.cfg" 2>/dev/null || true
   rm -f "$mnt/etc/netplan/"*.yaml "$mnt/etc/netplan/"*.yml 2>/dev/null || true
 
+  # 4b) DNS-Fallback: Ohne netplan/cloud-init schreibt bei reinem
+  # systemd-networkd niemand /etc/resolv.conf (das macht sonst nur
+  # systemd-resolved). Ist der Symlink auf resolved vorhanden, bleibt er;
+  # sonst statische Nameserver setzen - sonst scheitern apt/curl im Gast.
+  if [ -L "$mnt/etc/resolv.conf" ] && readlink "$mnt/etc/resolv.conf" 2>/dev/null | grep -q 'systemd/resolve'; then
+    : # systemd-resolved verwaltet resolv.conf - nichts anfassen
+  else
+    rm -f "$mnt/etc/resolv.conf"
+    printf 'nameserver 1.1.1.1\nnameserver 9.9.9.9\n' > "$mnt/etc/resolv.conf"
+  fi
+
   # 5) Hostname + cloud-init deaktivieren (damit es nichts überschreibt)
   echo "$VM_NAME" > "$mnt/etc/hostname"
+  # machine-id zurücksetzen: sonst haben alle VMs aus demselben Cloud-Image
+  # dieselbe ID (DHCPv6-DUID, journald, systemd) -> Lease-/Log-Kollisionen.
+  : > "$mnt/etc/machine-id" 2>/dev/null || true
+  rm -f "$mnt/var/lib/dbus/machine-id" 2>/dev/null || true
+  # /etc/hosts an den neuen Hostnamen anpassen (127.0.1.1-Zeile ersetzen).
+  touch "$mnt/etc/hosts"
+  grep -vE '^127\.0\.1\.1[[:space:]]' "$mnt/etc/hosts" > "$mnt/etc/hosts.comfyui.tmp" 2>/dev/null || true
+  printf '127.0.1.1 %s\n' "$VM_NAME" >> "$mnt/etc/hosts.comfyui.tmp"
+  mv "$mnt/etc/hosts.comfyui.tmp" "$mnt/etc/hosts"
   mkdir -p "$mnt/etc/cloud"
   touch "$mnt/etc/cloud/cloud-init.disabled"
 
@@ -1220,31 +1421,100 @@ fi
 # ----------------------------------------------------------------------------
 step 6 "VM starten"
 
+# Startet die VM und fängt die zwei bekannten Live-Blocker automatisch ab:
+#   1) "MAX n vcpus allowed per VM" -> CORES auf Host-Threads senken
+#   2) "Cannot allocate memory"     -> MEMORY schrittweise auf freien RAM senken
+# Ohne diese Fallbacks bleibt eine halbfertige VM liegen und der Einzeiler
+# bricht mit Exit 255 ab (Live-Fall 2026-11-11: 16-GB-Default auf kleinem Host).
+START_ERR=""
+START_RC=0
+try_qm_start() {
+  set +e
+  START_ERR="$(qm start "$VMID" 2>&1)"
+  START_RC=$?
+  set -e
+  if [ "$START_RC" -ne 0 ]; then
+    echo "$START_ERR" >&2
+  fi
+  return "$START_RC"
+}
+
+start_vm_with_fallback() {
+  local mem_now="" fit="" target=""
+
+  if try_qm_start; then
+    msg_ok "VM gestartet."
+    return 0
+  fi
+
+  # --- Fallback 1: vCPU-Limit ---
+  if echo "$START_ERR" | grep -q "vcpus allowed per VM"; then
+    msg_warn "qm start blockiert durch das vCPU-Limit des Nodes - setze CORES=${HOST_THREADS:-4} und starte erneut..."
+    if ! qm set "$VMID" --cores "${HOST_THREADS:-4}" >/dev/null 2>&1; then
+      msg_err "Konnte CORES nicht auf ${HOST_THREADS:-4} setzen (qm set fehlgeschlagen)."
+      return 1
+    fi
+    if try_qm_start; then
+      CORES="${HOST_THREADS:-4}"
+      msg_ok "VM gestartet (CORES automatisch auf ${CORES} reduziert)."
+      return 0
+    fi
+  fi
+
+  # --- Fallback 2: zu wenig Host-RAM ---
+  if echo "$START_ERR" | grep -qiE "cannot set up guest memory|Cannot allocate memory|out of memory"; then
+    print_ram_diagnostics
+    mem_now="$(qm config "$VMID" 2>/dev/null | awk '/^memory:/{print $2; exit}')"
+    case "${mem_now:-}" in ''|*[!0-9]*) mem_now="$MEMORY" ;; esac
+    fit="$(host_memory_fit_mb)"
+    if [ "$fit" -ge "$mem_now" ] || [ "$fit" -lt "$MIN_MEMORY_MB" ]; then
+      # MemAvailable war offenbar zu optimistisch (z.B. paralleler Start einer
+      # anderen VM oder overcommit_memory=2) bzw. liefert 0. Erst nur 1 GB
+      # weniger versuchen (schont die ComfyUI-Leistung), danach halbieren.
+      fit=$(( mem_now - 1024 ))
+      fit=$(( fit / 256 * 256 ))
+    fi
+    target="$fit"
+    while [ "$target" -ge "$MIN_MEMORY_MB" ] && [ "$target" -lt "$mem_now" ]; do
+      msg_warn "Start scheitert an RAM: reduziere ${mem_now} MB -> ${target} MB und versuche erneut..."
+      if ! qm set "$VMID" --memory "$target" >/dev/null 2>&1; then
+        msg_err "Konnte MEMORY nicht auf ${target} MB setzen (qm set fehlgeschlagen)."
+        break
+      fi
+      if try_qm_start; then
+        MEMORY="$target"
+        msg_warn "VM läuft mit ${target} MB RAM (angefordert war ${mem_now} MB)."
+        msg_warn "Mehr RAM später: VM stoppen, dann 'qm set ${VMID} --memory <MB>' und erneut starten."
+        return 0
+      fi
+      mem_now="$target"
+      target=$(( target / 2 ))
+      target=$(( target / 256 * 256 ))
+      # Nie unter das Minimum springen: bei 4096 -> 1920 wird stattdessen
+      # genau 2048 versucht (sonst bliebe der letzte sinnvolle Schritt aus).
+      if [ "$target" -lt "$MIN_MEMORY_MB" ] && [ "$mem_now" -gt "$MIN_MEMORY_MB" ]; then
+        target="$MIN_MEMORY_MB"
+      fi
+    done
+    msg_err "Auch mit reduziertem RAM (Minimum ${MIN_MEMORY_MB} MB) startet die VM nicht."
+  fi
+
+  return 1
+}
+
 VM_IP=""
 MAC=""
 STATIC_CANDIDATE=""
 if [ "$START_VM" = "yes" ]; then
-  # Starten mit Sicherheitsnetz: Falls der Node das vCPU-Limit trotzdem
-  # blockiert (z.B. bei anderem CPU-Typ oder zwischenzeitlich geändertem CORES),
-  # einmal automatisch reduzieren statt abzubrechen.
-  set +e
-  start_err="$(qm start "$VMID" 2>&1)"
-  start_rc=$?
-  set -e
-  if [ "$start_rc" -ne 0 ]; then
-    echo "$start_err" >&2
-    if echo "$start_err" | grep -q "vcpus allowed per VM"; then
-      msg_warn "qm start blockiert durch das vCPU-Limit des Nodes - setze CORES=${HOST_THREADS:-4} und starte erneut..."
-      qm set "$VMID" --cores "${HOST_THREADS:-4}"
-      qm start "$VMID"
-    else
-      msg_err "qm start schlug fehl (Ausgabe oben, Exit ${start_rc}). Diagnose:"
-      msg_err "  qm config ${VMID}   # Cores/Memory/Disks prüfen"
-      msg_err "  Details: ${LOG_FILE}"
-      exit 1
-    fi
+  if ! start_vm_with_fallback; then
+    msg_err "qm start schlug fehl (Ausgabe oben, Exit ${START_RC}). Die VM ${VMID} bleibt zum Debuggen erhalten."
+    msg_err "Diagnose:"
+    msg_err "  qm config ${VMID}                      # Cores/Memory/Disks prüfen"
+    msg_err "  qm set ${VMID} --memory 8192 && qm start ${VMID}"
+    msg_err "  qm destroy ${VMID}                     # VM samt Disks wieder entfernen"
+    msg_err "  Details: ${LOG_FILE}"
+    exit 1
   fi
-  msg_ok "VM gestartet."
 
   # --------------------------------------------------------------------------
   # Schritt 7: Auf IP-Adresse warten (mehrstufig - siehe detect_vm_ip)
@@ -1330,6 +1600,7 @@ if [ -n "$VM_IP" ] && [ "$WAIT_FOR_COMFYUI" = "yes" ]; then
   ssh -i "${SSH_PUBKEY_FILE%.pub}" \
       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       -o ConnectTimeout=10 -o LogLevel=ERROR \
+      -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
       "root@${VM_IP}" 'bash -s' < "${TMP_INSTALL}"
   rm -f "${TMP_INSTALL}"
 
@@ -1378,7 +1649,9 @@ fi
 echo
 echo "  VMID          : ${VMID}"
 echo "  Name          : ${VM_NAME}"
-echo "  Maschine      : ${MACHINE}"
+echo "  Maschine      : ${MACHINE} (${BIOS})"
+echo "  vCPU / RAM    : ${CORES} / ${MEMORY} MB"
+echo "  Disk          : ${DISK_SIZE} GB (${STORAGE})"
 echo "  SSH-Key       : ${SSH_PUBKEY_FILE}"
 echo "  Konsolen-PW   : ${CONSOLE_PASSWORD}  (NUR lokal über 'qm terminal ${VMID}' / Proxmox-Konsole, nicht per SSH)"
 if [ -n "$VM_IP" ]; then
