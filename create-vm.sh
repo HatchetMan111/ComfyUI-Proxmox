@@ -693,6 +693,8 @@ SNIFF_SECS="${SNIFF_SECS:-30}"                                       # Stufe 3: 
 SNIFF_PAUSE="${SNIFF_PAUSE:-10}"                                     # Stufe 3: Pause zwischen den Runden, Sekunden
 PCI_HOSTPCI="${PCI_HOSTPCI:-}"           # z.B. "01:00" -> GPU direkt bei Erstellung durchreichen
 NONINTERACTIVE="${NONINTERACTIVE:-}"     # 1 = Assistent überspringen, nur ENV-Variablen/Standardwerte nutzen
+SKIP_APP_INSTALL="${SKIP_APP_INSTALL:-0}" # 1 = nur VM anlegen/booten/SSH prüfen, ComfyUI nicht installieren (Testlauf)
+INSTALL_SKIPPED=0
 MEM_RESERVE_MB="${MEM_RESERVE_MB:-2048}" # RAM, der für den Proxmox-Host reserviert bleibt
 MIN_MEMORY_MB="${MIN_MEMORY_MB:-2048}"   # kleinste VM-RAM-Größe, die automatisch gesetzt werden darf
 FORCE_MEMORY="${FORCE_MEMORY:-0}"        # 1 = RAM-Begrenzung überspringen (auf eigene Gefahr)
@@ -901,10 +903,19 @@ if [ "$FORCE_MEMORY" != "1" ] && [ "$HOST_MEM_TOTAL_MB" -gt 0 ]; then
       msg_err "Zu wenig freier Host-RAM für eine sinnvolle VM:"
       msg_err "  verfügbar: ${HOST_MEM_AVAIL_MB} MB | Host-Reserve: ${MEM_RESERVE_MB} MB | nutzbar: ${MEM_FIT_MB} MB | Minimum: ${MIN_MEMORY_MB} MB"
       print_ram_diagnostics
+      # Realistischer Testwert: so viel, wie mit kleinerer Host-Reserve übrig
+      # bliebe - mindestens 1 GB, damit überhaupt ein Boot möglich ist.
+      TEST_MB=$(( (HOST_MEM_AVAIL_MB - 512) / 256 * 256 ))
+      [ "$TEST_MB" -lt 1024 ] && TEST_MB=1024
       msg_err "Optionen:"
       msg_err "  1) Andere VMs stoppen:  qm list   ->   qm shutdown <VMID>"
       msg_err "  2) Host-Speicher prüfen: free -m; swapon --show"
-      msg_err "  3) Bewusst erzwingen (qm start kann erneut scheitern):"
+      msg_err "  3) Nur den Ablauf testen (wenig RAM, Installation überspringen):"
+      msg_err "     FORCE_MEMORY=1 MEMORY=${TEST_MB} SKIP_APP_INSTALL=1 \\"
+      msg_err "       bash -c \"\$(curl -fsSL ${INSTALL_SCRIPT_URL%/install.sh}/create-vm.sh)\""
+      msg_err "     -> VM anlegen + booten + SSH prüfen. Danach bei Bedarf:"
+      msg_err "        qm set ${VMID:-<VMID>} --memory <MB>; dann install.sh in der VM starten"
+      msg_err "  4) Bewusst mit ${MEMORY} MB erzwingen (qm start scheitert voraussichtlich):"
       msg_err "     FORCE_MEMORY=1 MEMORY=${MEMORY} bash -c \"\$(curl -fsSL ${INSTALL_SCRIPT_URL%/install.sh}/create-vm.sh)\""
       exit 1
     fi
@@ -913,8 +924,12 @@ if [ "$FORCE_MEMORY" != "1" ] && [ "$HOST_MEM_TOTAL_MB" -gt 0 ]; then
     MEMORY="$MEM_FIT_MB"
   fi
   if [ "$MEMORY" -lt 8192 ]; then
-    msg_warn "Mit ${MEMORY} MB RAM ist ComfyUI stark eingeschränkt (SD 1.5/CPU okay, SDXL/Flux brauchen >= 12-16 GB)."
-    msg_warn "Mehr RAM: andere VMs stoppen oder den Host aufrüsten. Später anpassbar mit: qm set ${VMID} --memory <MB>"
+    if [ "${SKIP_APP_INSTALL:-0}" = "1" ]; then
+      msg_info "Testlauf (SKIP_APP_INSTALL=1): ${MEMORY} MB reichen für VM/Boot/SSH - ComfyUI selbst braucht >= 8 GB."
+    else
+      msg_warn "Mit ${MEMORY} MB RAM ist ComfyUI stark eingeschränkt (SD 1.5/CPU okay, SDXL/Flux brauchen >= 12-16 GB)."
+      msg_warn "Mehr RAM: andere VMs stoppen oder den Host aufrüsten. Später anpassbar mit: qm set ${VMID} --memory <MB>"
+    fi
   fi
 elif [ "$FORCE_MEMORY" = "1" ]; then
   msg_warn "FORCE_MEMORY=1: RAM-Begrenzung übersprungen - 'qm start' kann an fehlendem Host-RAM scheitern."
@@ -1568,31 +1583,9 @@ fi
 # ----------------------------------------------------------------------------
 # Schritt 8: ComfyUI per SSH installieren und auf Webserver warten
 # ----------------------------------------------------------------------------
-if [ -n "$VM_IP" ] && [ "$WAIT_FOR_COMFYUI" = "yes" ]; then
-  step 8 "ComfyUI installieren (per SSH auf ${VM_IP})"
-
-  # 8a: Auf SSH warten (sshd läuft in Cloud-Images sofort nach dem Boot)
-  msg_info "Warte auf SSH-Port 22..."
-  set +e
-  QUIET_ERR=1
-  SSH_READY=0
-  for _ in $(seq 1 60); do   # 60 x 5s = max. 5 Minuten
-    if timeout 3 bash -c "</dev/tcp/${VM_IP}/22" 2>/dev/null; then
-      SSH_READY=1
-      break
-    fi
-    sleep 5
-  done
-  QUIET_ERR=0
-  set -e
-
-  if [ "$SSH_READY" != "1" ]; then
-    msg_err "SSH auf ${VM_IP} nach 5 Minuten nicht erreichbar – Installation kann nicht starten."
-    msg_err "Manuell prüfen: ssh -i ${SSH_PUBKEY_FILE%.pub} root@${VM_IP}"
-    exit 1
-  fi
-  msg_ok "SSH erreichbar."
-
+# 8b + 8c als Funktion, damit SKIP_APP_INSTALL (Testlauf) sauber davor abbiegen
+# kann, ohne den Ablauf zu duplizieren. Setzt COMFYUI_READY.
+install_comfyui_in_vm() {
   # 8b: install.sh herunterladen und in der VM ausführen (Output wird live gestreamt)
   TMP_INSTALL="/tmp/comfyui-install-$$.sh"
   curl -fsSL --retry 3 --retry-delay 2 "${INSTALL_SCRIPT_URL}" -o "${TMP_INSTALL}"
@@ -1602,6 +1595,7 @@ if [ -n "$VM_IP" ] && [ "$WAIT_FOR_COMFYUI" = "yes" ]; then
       -o ConnectTimeout=10 -o LogLevel=ERROR \
       -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
       "root@${VM_IP}" 'bash -s' < "${TMP_INSTALL}"
+  # Auch bei Fehlern aufräumen (kein Key-Material/Token im /tmp des Hosts)
   rm -f "${TMP_INSTALL}"
 
   # 8c: Auf den ComfyUI-Webserver warten
@@ -1631,6 +1625,41 @@ if [ -n "$VM_IP" ] && [ "$WAIT_FOR_COMFYUI" = "yes" ]; then
     msg_warn "Port ${COMFYUI_PORT} nach $((WAIT_TIMEOUT / 60)) Minuten nicht erreichbar."
     msg_warn "In der VM prüfen: journalctl -u comfyui -e"
   fi
+}
+
+if [ -n "$VM_IP" ] && [ "$WAIT_FOR_COMFYUI" = "yes" ]; then
+  step 8 "ComfyUI installieren (per SSH auf ${VM_IP})"
+
+  # 8a: Auf SSH warten (sshd läuft in Cloud-Images sofort nach dem Boot)
+  msg_info "Warte auf SSH-Port 22..."
+  set +e
+  QUIET_ERR=1
+  SSH_READY=0
+  for _ in $(seq 1 60); do   # 60 x 5s = max. 5 Minuten
+    if timeout 3 bash -c "</dev/tcp/${VM_IP}/22" 2>/dev/null; then
+      SSH_READY=1
+      break
+    fi
+    sleep 5
+  done
+  QUIET_ERR=0
+  set -e
+
+  if [ "$SSH_READY" != "1" ]; then
+    msg_err "SSH auf ${VM_IP} nach 5 Minuten nicht erreichbar – Installation kann nicht starten."
+    msg_err "Manuell prüfen: ssh -i ${SSH_PUBKEY_FILE%.pub} root@${VM_IP}"
+    exit 1
+  fi
+  msg_ok "SSH erreichbar."
+
+  if [ "${SKIP_APP_INSTALL:-0}" = "1" ]; then
+    INSTALL_SKIPPED=1
+    COMFYUI_READY=0
+    msg_warn "SKIP_APP_INSTALL=1: ComfyUI wird NICHT installiert."
+    msg_warn "Der Testlauf ist damit durch: VM angelegt, gebootet, Netzwerk + SSH funktionieren."
+  else
+    install_comfyui_in_vm
+  fi
 else
   COMFYUI_READY=0
 fi
@@ -1658,6 +1687,28 @@ if [ -n "$VM_IP" ]; then
   echo "  VM-IP         : ${VM_IP}"
 fi
 echo
+
+# Testlauf (SKIP_APP_INSTALL=1): VM + Boot + Netzwerk + SSH sind bewiesen,
+# ComfyUI wurde absichtlich nicht installiert.
+if [ "${INSTALL_SKIPPED:-0}" = "1" ]; then
+  echo
+  msg_ok "════════════════════════════════════════════════════════"
+  msg_ok "  TESTLAUF OK: VM erstellt, gebootet, Netzwerk + SSH laufen"
+  msg_ok "════════════════════════════════════════════════════════"
+  echo
+  echo "  Die VM bleibt stehen (gestoppt wird nichts). Nächste Schritte:"
+  echo
+  echo "  1) RAM auf einen für ComfyUI sinnvollen Wert setzen (>= 8 GB):"
+  echo "       qm set ${VMID} --memory 8192 --balloon 0"
+  echo
+  echo "  2) Installation in der VM nachholen:"
+  echo "       ssh -i ${SSH_PUBKEY_FILE%.pub} root@${VM_IP} \\"
+  echo "         'bash -c \"\$(curl -fsSL ${INSTALL_SCRIPT_URL})\"'"
+  echo
+  echo "  3) Danach: http://${VM_IP}:${COMFYUI_PORT}"
+  echo
+  exit 0
+fi
 
 # Erfolg: ComfyUI ist erreichbar -> großes Abschluss-Banner mit der URL
 if [ "${COMFYUI_READY:-0}" = "1" ]; then

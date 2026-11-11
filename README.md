@@ -107,6 +107,31 @@ Anlegen der VM mit einer RAM-Diagnose ab, statt eine unstartbare VM zu
 hinterlassen. Mehr Platz schaffen: `qm list`, dann nicht benötigte VMs mit
 `qm shutdown <VMID>` stoppen.
 
+### Ablauf testen, wenn der Host klein ist
+
+Für einen reinen Funktionstest (VM anlegen → booten → IP finden → SSH) braucht
+es keinen ComfyUI-tauglichen RAM. Mit `SKIP_APP_INSTALL=1` wird die
+Installation übersprungen und der Lauf endet nach der SSH-Prüfung:
+
+```bash
+FORCE_MEMORY=1 MEMORY=2048 SKIP_APP_INSTALL=1 \
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/ComfyUI-Proxmox/main/create-vm.sh)"
+```
+
+2 GB reichen dafür (ComfyUI selbst braucht später ≥ 8 GB). Danach RAM erhöhen
+und die Installation in der VM nachholen:
+
+```bash
+qm set <VMID> --memory 8192 --balloon 0
+ssh -i /root/.ssh/comfyui_vm_key root@<VM-IP> \
+  'bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/ComfyUI-Proxmox/main/install.sh)"'
+```
+
+| Variable | Standard | Bedeutung |
+|---|---|---|
+| `SKIP_APP_INSTALL=1` | aus | nur VM/Boot/Netzwerk/SSH testen, ComfyUI nicht installieren |
+
+
 ## 🔄 Reboot-Sicherheit
 
 - VM: `onboot: 1` (startet mit dem Host)
