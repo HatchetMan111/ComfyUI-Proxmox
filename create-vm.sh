@@ -48,7 +48,7 @@ msg_ok()   { echo -e "${C_OK}✔${C_RESET} $*"; }
 msg_warn() { echo -e "${C_WARN}⚠${C_RESET} $*"; }
 msg_err()  { echo -e "${C_ERR}✖${C_RESET} $*" >&2; }
 
-SCRIPT_BUILD="2026-11-11-v1"
+SCRIPT_BUILD="2026-11-11-v2"
 echo -e "${C_STEP}ComfyUI-Proxmox create-vm.sh – Build ${SCRIPT_BUILD}${C_RESET}"
 echo -e "${C_STEP}Wenn hier NICHT 'Build ${SCRIPT_BUILD}' steht, führst du eine alte Kopie aus!${C_RESET}"
 echo -e "${C_STEP}Log: /var/log/comfyui-create-vm-<VMID>.log (wird nach Feststehen der VMID angelegt)${C_RESET}"
@@ -694,6 +694,7 @@ SNIFF_PAUSE="${SNIFF_PAUSE:-10}"                                     # Stufe 3: 
 PCI_HOSTPCI="${PCI_HOSTPCI:-}"           # z.B. "01:00" -> GPU direkt bei Erstellung durchreichen
 NONINTERACTIVE="${NONINTERACTIVE:-}"     # 1 = Assistent überspringen, nur ENV-Variablen/Standardwerte nutzen
 SKIP_APP_INSTALL="${SKIP_APP_INSTALL:-0}" # 1 = nur VM anlegen/booten/SSH prüfen, ComfyUI nicht installieren (Testlauf)
+KEEP_ON_FAILURE="${KEEP_ON_FAILURE:-0}"   # 1 = unbrauchbare VM bei Abbruch NICHT automatisch löschen (Debuggen)
 INSTALL_SKIPPED=0
 MEM_RESERVE_MB="${MEM_RESERVE_MB:-2048}" # RAM, der für den Proxmox-Host reserviert bleibt
 MIN_MEMORY_MB="${MIN_MEMORY_MB:-2048}"   # kleinste VM-RAM-Größe, die automatisch gesetzt werden darf
@@ -1212,6 +1213,58 @@ find_free_nbd() {
   return 1
 }
 
+# Schreibt einen SHA-512-Hash direkt in <mnt>/etc/shadow (Feld 2 der root-Zeile).
+# Bewusst PAM-frei: 'chpasswd --root' startet im Gast-chroot die komplette
+# PAM-/NSS-Kette und scheitert dort mit "Authentication token manipulation
+# error" (Live-Fall 2026-11-11). Ein direkter Shadow-Eintrag funktioniert in
+# jedem Cloud-Image, ohne /proc, /dev oder pam_unix.
+set_root_password() {
+  local mnt="$1" pass="$2" shadow="$1/etc/shadow" hash="" tmp
+  [ -f "$shadow" ] || { msg_err "Kein ${shadow} gefunden - Image unerwartet aufgebaut."; return 1; }
+
+  if command -v openssl >/dev/null 2>&1; then
+    hash="$(openssl passwd -6 "$pass" 2>/dev/null || true)"
+  fi
+  if [ -z "$hash" ] && command -v python3 >/dev/null 2>&1; then
+    # python3-crypt gibt es nur bis 3.12 - als optionaler Zweitweg.
+    hash="$(python3 -c 'import crypt,sys; print(crypt.crypt(sys.argv[1], crypt.mksalt(crypt.METHOD_SHA512)))' "$pass" 2>/dev/null || true)"
+  fi
+
+  if [ -z "$hash" ]; then
+    # Letzter Ausweg: PAM-Weg, aber mit /dev/null im chroot (häufigste Ursache).
+    msg_warn "Kein Hash-Tool (openssl/python3) verfügbar - versuche chpasswd im chroot..."
+    mkdir -p "$mnt/dev"
+    [ -e "$mnt/dev/null" ] || { : > "$mnt/dev/null"; chmod 666 "$mnt/dev/null"; }
+    if echo "root:${pass}" | chpasswd --root "$mnt" 2>/dev/null; then
+      msg_ok "Root-Passwort per chpasswd gesetzt (Fallback)."
+      return 0
+    fi
+    msg_err "Auch der chpasswd-Fallback ist gescheitert."
+    return 1
+  fi
+
+  tmp="$(mktemp "${shadow}.XXXXXX" 2>/dev/null)" || { msg_err "Temp-Datei in $mnt/etc nicht anlegbar."; return 1; }
+  if ! awk -v h="$hash" '
+      BEGIN { FS=OFS=":"; found=0 }
+      $1=="root" { $2=h; found=1 }
+      { print }
+      END { exit (found ? 0 : 1) }
+    ' "$shadow" > "$tmp"; then
+    rm -f "$tmp"
+    msg_err "root-Zeile in /etc/shadow nicht gefunden."
+    return 1
+  fi
+  chmod 600 "$tmp" 2>/dev/null || true
+  chown 0:0 "$tmp" 2>/dev/null || true
+  if ! mv -f "$tmp" "$shadow"; then
+    rm -f "$tmp"
+    msg_err "Konnte /etc/shadow nicht ersetzen."
+    return 1
+  fi
+  msg_ok "Root-Passwort gesetzt (SHA-512 direkt in /etc/shadow, PAM-frei)."
+  return 0
+}
+
 prepare_image() {
   local mnt="/mnt/comfyui-prepare"
   local vol_spec vol_dev part p nbd_dev
@@ -1271,8 +1324,15 @@ except Exception:
   msg_ok "Root-Partition gemountet: ${part}"
 
   # 1) Root-Passwort direkt setzen (das aus der Zusammenfassung, später per 'passwd' änderbar)
-  echo "root:${CONSOLE_PASSWORD}" | chpasswd --root "$mnt" \
-    || { msg_err "chpasswd fehlgeschlagen"; umount "$mnt"; qemu-nbd -d "$nbd_dev" >/dev/null 2>&1; return 1; }
+  # KEIN 'chpasswd --root': das startet im Gast-chroot die komplette PAM-Kette
+  # (pam_unix -> /proc, /dev, NSS, Schreibrechte auf /etc/shadow) und scheitert
+  # auf Proxmox-Hosts reproduzierbar mit:
+  #   chpasswd: (user root) pam_chauthtok() failed, error:
+  #   Authentication token manipulation error
+  # Stattdessen den SHA-512-Hash direkt in /etc/shadow schreiben - PAM-frei,
+  # funktioniert in jedem Cloud-Image (Live-Fall 2026-11-11, VM 101).
+  set_root_password "$mnt" "$CONSOLE_PASSWORD" \
+    || { msg_err "Root-Passwort konnte nicht gesetzt werden (/etc/shadow nicht beschreibbar?)"; umount "$mnt"; qemu-nbd -d "$nbd_dev" >/dev/null 2>&1; return 1; }
 
   # 2) SSH-Key für root hinterlegen
   mkdir -p "$mnt/root/.ssh"
@@ -1427,7 +1487,20 @@ if prepare_image; then
   msg_ok "Netzwerk über systemd-networkd aktiviert (${IPCONFIG}), cloud-init deaktiviert."
   msg_info "Geschriebene Netzconfig: /etc/systemd/network/89-comfyui.network (im Gast prüfen mit: cat /etc/systemd/network/89-comfyui.network; networkctl status)"
 else
-  msg_err "Image-Vorbereitung fehlgeschlagen - breche ab (VM wurde NICHT gestartet)."
+  msg_err "Image-Vorbereitung fehlgeschlagen - VM wurde NICHT gestartet."
+  # Eine VM, die nie gebootet hat und kein Passwort/Netzwerk hat, ist wertlos -
+  # sie belegt aber 3,5 GB+. Deshalb standardmäßig aufräumen, damit der nächste
+  # Lauf nicht an "VMID existiert bereits" oder vollem Storage scheitert.
+  if [ "${KEEP_ON_FAILURE:-0}" = "1" ]; then
+    msg_warn "KEEP_ON_FAILURE=1: VM ${VMID} bleibt zum Debuggen stehen (aufräumen mit: qm destroy ${VMID})."
+  else
+    msg_info "Räume die unbrauchbare VM ${VMID} auf (behalten mit KEEP_ON_FAILURE=1)..."
+    if qm destroy "$VMID" --purge >/dev/null 2>&1; then
+      msg_ok "VM ${VMID} entfernt."
+    else
+      msg_warn "qm destroy ${VMID} fehlgeschlagen - bitte manuell aufräumen: qm destroy ${VMID}"
+    fi
+  fi
   exit 1
 fi
 

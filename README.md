@@ -130,6 +130,7 @@ ssh -i /root/.ssh/comfyui_vm_key root@<VM-IP> \
 | Variable | Standard | Bedeutung |
 |---|---|---|
 | `SKIP_APP_INSTALL=1` | aus | nur VM/Boot/Netzwerk/SSH testen, ComfyUI nicht installieren |
+| `KEEP_ON_FAILURE=1` | aus | VM bei einem Abbruch nicht automatisch löschen (zum Debuggen) |
 
 
 ## 🔄 Reboot-Sicherheit
@@ -146,6 +147,7 @@ ssh -i /root/.ssh/comfyui_vm_key root@<VM-IP> \
 | `MAX n vcpus allowed per VM on this node` | Host hat weniger Threads als gewählte Cores (bei `cpu=host` Limit). Das Script begrenzt **automatisch** auf die Node-Threads (Build ≥ 2026-11-10-v2); bei älteren Läufen: `qm set <VMID> --cores $(nproc) && qm start <VMID>` |
 | `cannot set up guest memory 'pc.ram': Cannot allocate memory` | Auf dem Host ist zu wenig RAM frei. Seit Build **2026-11-11-v1** begrenzt `create-vm.sh` `MEMORY` vorab automatisch und halbiert beim Start notfalls. Manuell: `free -m`, nicht benötigte VMs stoppen, dann `qm set <VMID> --memory 8192 && qm start <VMID>`. Hängengebliebene VM entfernen: `qm destroy <VMID>` |
 | `storage ... does not have enough space` | `create-vm.sh` prüft den freien Platz vorab und bricht mit Klartext ab. Anderen Storage via `STORAGE=<id>` wählen oder Platz schaffen. |
+| `chpasswd: ... Authentication token manipulation error` | `chpasswd --root` startet im Gast-chroot die PAM-Kette und scheitert dort (fehlendes `/dev`, NSS, Shadow-Rechte). Seit Build **2026-11-11-v2** schreibt `create-vm.sh` den SHA-512-Hash direkt in `/etc/shadow` (PAM-frei). Bei älteren Läufen: VM löschen und neu erstellen. |
 | Web-UI nicht erreichbar | `systemctl status comfyui` + `journalctl -u comfyui -e` in der VM; Firewall-Port 8188 (in der VM keine UFW aktiv, am Proxmox-Firewall-Profil prüfen) |
 | IP-Erkennung fehlgeschlagen | `qm terminal <VMID>` → `ip a`; danach install.sh direkt in der VM ausführen |
 | `nvidia-smi` fehlt in der VM | Passthrough-Konfig am Host prüfen (IOMMU!); VM-Reboot; `lspci | grep -i nvidia` in der VM |
